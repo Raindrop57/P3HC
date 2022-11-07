@@ -10,6 +10,8 @@ import os
 from netCDF4 import Dataset
 from scipy.optimize import curve_fit
 import shutil
+import math
+from statistics import mean
 
 def process_raw_PHIPS_images(import_path, export_path, campaign, e_b, dark_threshold, x_dim, y_dim):
     
@@ -32,7 +34,7 @@ def process_raw_PHIPS_images(import_path, export_path, campaign, e_b, dark_thres
         directory containing processed PHIPS images
     '''
     
-    # Note: 1 pixel is 0.00645 microns after processing.
+    # Note: 1 pixel is 0.01 mm after processing.
     
     # Path for directory containing raw PHIPS images in .png format
     image_root = pathlib.Path(import_path)
@@ -43,7 +45,7 @@ def process_raw_PHIPS_images(import_path, export_path, campaign, e_b, dark_thres
     # Read filenames as an ordered list of strings; this is done so that images
     # are processed in an expected order
     # All files in folder ending with *.png are read
-    list_ds = list(image_root.glob('*.png'))
+    list_ds = list(image_root.glob('*png'))
     list_temp = np.empty(shape=(len(list_ds),), dtype='object')
     ii = 0
     for f in list_ds:
@@ -51,11 +53,6 @@ def process_raw_PHIPS_images(import_path, export_path, campaign, e_b, dark_thres
         ii += 1
     list_temp = np.sort(list_temp)
     list_ds = list_temp   
-    
-    # Resolution to save images at
-    # Currently set at 1/4 of raw resolution to remove single-pixel blemishes
-    y_dim = 256
-    x_dim = 340
     
     # Number of raw images processed
     num_iterations=0
@@ -78,12 +75,17 @@ def process_raw_PHIPS_images(import_path, export_path, campaign, e_b, dark_thres
         im_name = im_name[len(import_path):]
     
         # Open and resize image, then convert to array format for easy processing
-        im = PIL.Image.open(im_path)
-        im = im.resize((x_dim,y_dim))
-        im = np.array(im)
+        try:
+            im = PIL.Image.open(im_path)
+            im = im.resize((x_dim,y_dim))
+            im = np.array(im)
+            
+        except OSError:
+            print(f"OSError, image name = {im_name}")
+            continue
         
         if campaign == 'IMPACTS':
-            im[9:12,20:23] = 255 #Remove dark spot on image
+            im[6:8,13:15] = 255 #Remove dark spot on image
         
         # Convert image to black and white, according to a threshold value    
         im[im < dark_threshold] = 0
@@ -226,9 +228,8 @@ def analyze_images(import_path, export_path, date, campaign, write_netCDF, e_b, 
         e_b: number of pixels on edge of image to ignore in analysis
         dark_threshold: brightness level (0-255) considered as a "darkened" pixel
     '''
-    
-    zoom_factor = 4 # Factor by which images are zoomed in on probe
-    pixel_in_mm = 0.0258/zoom_factor
+
+    pixel_in_mm = 0.01
 
     # Get maximum dimension of crystal image 'im' (in terms of pixels) by finding the 
     # diagonal length of the smallest enclosing coordinate-locked rectangle
@@ -277,63 +278,198 @@ def analyze_images(import_path, export_path, date, campaign, write_netCDF, e_b, 
     def get_perim(im):
         
         perim = 0
-        # Iterate through each column
+        area = 0
+        
+        widths = np.empty(shape = (0,))
+        lengths = np.empty(shape = (0,))
+        
         for x in range (e_b, len(im[0,:]) - e_b):
+            
+            min_y_col = -1
+            max_y_col = -1
+    
             val_prev = im[e_b, x]
             for y in range(e_b + 1, len(im[:,0]) - e_b):
                 val = im[y, x]
                 
                 if val != val_prev:
-                    # Add 1 to perimeter for each change in pixel status
+                    # Add 1 to perimeter for each change in diode status
                     perim += 1
                 val_prev = val
+                
+                if(val < 255):
+                    if min_y_col < 0:
+                        min_y_col = y
+                    max_y_col = y
+                    
+                if val < 255:
+                    area += 1
     
-            # Add 1 to perimeter for every illuminated pixel on edge
+            # Add 1 to perimeter for every illuminated diode on edge
             if im[e_b, x] < 255:
                 perim += 1
             if im[len(im[:,0]) - e_b - 1, x] < 255:
                 perim += 1
+                
+            if min_y_col >= 0:
+                widths = np.append(widths, max_y_col - min_y_col)
         
-        # Iterate though each row    
+            
         for y in range (e_b, len(im[:,e_b])):
             val_prev = im[y, e_b]
+            
+            min_x_col = -1
+            max_x_col = -1
+            
             for x in range(e_b + 1, len(im[0,:]) - e_b):
                 val = im[y, x]
                 
                 if val != val_prev:
                     perim += 1
                 val_prev = val
+                
+                if(val < 255):
+                    if min_x_col < 0:
+                        min_x_col = x
+                    max_x_col = x
+                    
+            if min_x_col >= 0:
+                lengths = np.append(lengths, max_x_col - min_x_col)
+    
        
-            # Add 1 to perimeter for every illuminated pixel on edge
+            # Add 1 to perimeter for every illuminated diode on edge
             if im[y, e_b] < 255:
                 perim += 1
             if im[y, len(im[0,:]) - e_b - 1] < 255:
                 perim += 1
         
-        return perim            
+        w_l_std = min(round(np.std(lengths), 1), round(np.std(widths), 1))
+        
+        return perim, w_l_std, area        
     
     # Get coefficient of determination for a crystal image
     def get_r2(im):
-        
-        # Iterate through entire image array to obtain list of coordinates
-        # for all darkened pixels
-        x_vals = np.empty(shape = (0,))
-        y_vals = np.empty(shape = (0,))
-        for x in range (e_b, len(im[0,:]) - e_b):
-            for y in range(e_b, len(im[:,0]) - e_b):
-                val = im[y, x]
-                if val < 255:
-                    x_vals = np.append(x_vals, x)
-                    y_vals = np.append(y_vals, y)
-        
-        # Get correlation coefficient for darkened pixels
-        r_2 = round(np.corrcoef(x_vals, y_vals)[0,1]**2, 3)
-        return r_2
+         
+         min_xr = 32768
+         max_xr = -32768
+         min_yr = 32768
+         max_yr = -32768
+         
+         x_vals = np.empty(shape = (0,))
+         y_vals = np.empty(shape = (0,))
+         
+         xr_vals = np.empty(shape = (0,))
+         yr_vals = np.empty(shape = (0,))   
+         
+         for x in range (e_b, len(im[0,:]) - e_b):
+             for y in range(e_b, len(im[:,0]) - e_b):
+                 val = im[y, x]
+                 if val < 255:
+                     x_vals = np.append(x_vals, x)
+                     y_vals = np.append(y_vals, y)
+                     
+         r_2 = round(np.corrcoef(x_vals, len(im[0,:])-y_vals)[0,1]**2, 3)
+    
+         slope, intercept = np.polyfit(x_vals, len(im[0,:])-y_vals, 1)
+         angle_radian = np.arctan(slope)
+         
+         if(angle_radian < 0):
+             angle_radian += math.pi
+         
+         for x in range (e_b, len(im[0,:]) - e_b):
+             for y in range(e_b, len(im[:,0]) - e_b):
+                 val = im[y, x]
+                 
+                 if val < 255:
+                     xr = int(round((x * math.cos(angle_radian)) - (y * math.sin(angle_radian))))
+                     yr = int(round((x * math.sin(angle_radian)) + (y * math.cos(angle_radian))))
+                     
+                     xr_vals = np.append(xr_vals, xr)
+                     yr_vals = np.append(yr_vals, yr)
+                     
+                     if(xr < min_xr):
+                         min_xr = xr
+                         
+                     if(xr > max_xr):
+                         max_xr = xr
+                         
+                     if(yr < min_yr):
+                         min_yr = yr
+                     
+                     if(yr > max_yr):
+                         max_yr = yr
+                         
+         x_dim_shifted = int(max_xr - min_xr)
+         y_dim_shifted = int(max_yr - min_yr)
+         
+         widths_r = np.empty(shape = (0,))
+         lengths_r = np.empty(shape = (0,))
+         
+         max_gap_x = -32768
+         max_gap_y = -32768
+         prev_xr = 32768
+         prev_yr = 32768
+         
+         for x in np.unique(xr_vals):
+             yr_vals_row = yr_vals[xr_vals == x]
+             widths_r = np.append(widths_r, max(yr_vals_row) - min(yr_vals_row))
+    
+             if (x - prev_xr > max_gap_x):
+                 max_gap_x = x - prev_xr
+             prev_xr = x
+             
+             
+         for y in np.unique(yr_vals):
+             yr_vals_row = xr_vals[yr_vals == y]
+             lengths_r = np.append(lengths_r, max(yr_vals_row) - min(yr_vals_row))
+    
+             if (y - prev_yr > max_gap_y):
+                 max_gap_y = y - prev_yr
+             prev_yr = y
+         
+         w_l_r_percents = min(round(np.percentile(lengths_r, 75) - np.percentile(lengths_r, 25), 1),  
+                          round(np.percentile(widths_r, 75) - np.percentile(widths_r, 25), 1))
+         #print(f'{round(np.std(widths_r), 1)}, {round(np.std(lengths_r), 1)}')
+         #print(f'{round(np.percentile(widths_r, 75) - np.percentile(widths_r, 25), 1)}, {round(np.percentile(lengths_r, 75) - np.percentile(lengths_r, 25), 1)}')
+         
+         max_gap = max(max_gap_x, max_gap_y)
+         
+         return r_2, x_dim_shifted, y_dim_shifted, w_l_r_percents, max_gap
     
     # Get opacity coefficient for image, with re_f being a reduction factor
     # for the image resolution
     def get_O(im_string, re_f):
         
+        count_fully_occulted = 0
+        count_any_occulted = 0
+        
+        for x in range (e_b, len(im[0,:]) - e_b):
+
+            vertical_slice = im[:,x]
+            
+            first_y = -1
+            last_y = -1
+            
+            for y in range(e_b, len(im[:,0]) - e_b):
+                
+                if vertical_slice[y] < 255:
+                    if first_y < 0:
+                        first_y = y
+                    last_y = y
+                    
+            if first_y >= 0:
+                vertical_slice = vertical_slice[first_y:last_y + 1]
+                count_any_occulted += 1
+                if len(vertical_slice[vertical_slice < 255])/len(vertical_slice) >= 0.8:
+                    count_fully_occulted += 1
+        
+        try:
+            O = round(count_fully_occulted/count_any_occulted, 3)
+        except ZeroDivisionError:
+            O = 0
+        return O
+        
+        '''
         # Get reduced-resolution image
         im_smaller = PIL.Image.open(im_string)
         im_smaller = im_smaller.resize((round(len(im[0,:])/re_f),round(len(im[:,0])/re_f)))
@@ -351,10 +487,242 @@ def analyze_images(import_path, export_path, date, campaign, write_netCDF, e_b, 
             # I've encountered this before, so as a failsafe, O is set to zero
             O = 0
         return O
+        '''
     
-    # Calculate the crystal habit based on its morphological properties
+    def get_all_params(im):
+        
+        x_vals = np.empty(shape = (0,))
+        y_vals = np.empty(shape = (0,))
+        
+        for x in range (e_b, len(im[0,:]) - e_b):
+            for y in range(e_b, len(im[:,0]) - e_b):
+                val = im[y, x]
+                if val < 255:
+                    x_vals = np.append(x_vals, x)
+                    y_vals = np.append(y_vals, y)
+                    
+        r_2 = round(np.corrcoef(x_vals, len(im[0,:])-y_vals)[0,1]**2, 3)
     
-    def get_habit(a, r_2, d, O, F, x, y):
+        if(r_2 >= 0.3):
+            slope, intercept = np.polyfit(x_vals, len(im[0,:])-y_vals, 1)
+            angle_radian = np.arctan(slope)
+            
+        else:
+            angle_radian = 0
+        
+        if(angle_radian < 0):
+            angle_radian += math.pi
+        
+        count_fully_occulted_r = 0
+        count_any_occulted_r = 0
+        count_fully_occulted_c = 0
+        count_any_occulted_c = 0
+     
+        perim = 0
+        area = 0
+        num_on_edge = 0
+        
+        xr_vals = np.empty(shape = (0,))
+        yr_vals = np.empty(shape = (0,))   
+        
+        min_xr = 32768
+        max_xr = -32768
+        min_yr = 32768
+        max_yr = -32768
+        
+        for x in range (e_b, len(im[0,:]) - e_b):
+    
+            val_prev = im[e_b, x]
+            for y in range(e_b + 1, len(im[:,0]) - e_b):
+                val = im[y, x]
+                
+                if val != val_prev:
+                    # Add 1 to perimeter for each change in diode status
+                    perim += 1
+                val_prev = val
+                
+                if(val < 255):
+                    
+                    xr = int(round((x * math.cos(angle_radian)) - (y * math.sin(angle_radian))))
+                    yr = int(round((x * math.sin(angle_radian)) + (y * math.cos(angle_radian))))
+                    
+                    xr_vals = np.append(xr_vals, xr)
+                    yr_vals = np.append(yr_vals, yr)
+                    
+                    if(xr < min_xr):
+                        min_xr = xr
+                        
+                    if(xr > max_xr):
+                        max_xr = xr
+                        
+                    if(yr < min_yr):
+                        min_yr = yr
+                    
+                    if(yr > max_yr):
+                        max_yr = yr
+                    
+                if val < 255:
+                    area += 1
+    
+            # Add 1 to perimeter for every illuminated diode on edge
+            if im[e_b, x] < 255:
+                perim += 1
+                num_on_edge += 1
+            if im[len(im[:,0]) - e_b - 1, x] < 255:
+                perim += 1
+                num_on_edge += 1
+                  
+        x_dim_shifted = int(max_xr - min_xr)
+        y_dim_shifted = int(max_yr - min_yr)
+        
+        widths_r = np.empty(shape = (0,))
+        lengths_r = np.empty(shape = (0,))
+    
+        max_gap_x = -32768
+        max_gap_y = -32768
+        prev_xr = 32768
+        prev_yr = 32768
+        
+        for x in np.unique(xr_vals):
+            yr_vals_row = yr_vals[xr_vals == x]
+            
+            width_r =  max(yr_vals_row) - min(yr_vals_row) + 1
+            frac_occulted_r = len(yr_vals_row)/width_r
+            
+            widths_r = np.append(widths_r, width_r)
+            
+            if frac_occulted_r >= 0.8:
+                count_fully_occulted_r += 1
+            count_any_occulted_r += 1
+    
+            if (x - prev_xr > max_gap_x):
+                max_gap_x = x - prev_xr
+            
+            prev_xr = x
+        
+        
+        for y in np.unique(yr_vals):
+            xr_vals_col = xr_vals[yr_vals == y]
+            length_c =  max(xr_vals_col) - min(xr_vals_col) + 1
+            frac_occulted_c = len(xr_vals_col)/length_c
+            lengths_r = np.append(lengths_r, length_c)
+            
+            if frac_occulted_c >= 0.8:
+                count_fully_occulted_c += 1
+            count_any_occulted_c += 1
+    
+            if (y - prev_yr > max_gap_y):
+                max_gap_y = y - prev_yr
+                
+            prev_yr = y
+    
+        #print(f'{round(np.std(widths_r), 1)}, {round(np.std(lengths_r), 1)}')
+        #print(f'{round(np.percentile(widths_r, 75) - np.percentile(widths_r, 25), 1)}, {round(np.percentile(lengths_r, 75) - np.percentile(lengths_r, 25), 1)}')
+    
+        max_gap = max(max_gap_x, max_gap_y)
+            
+        for y in range (e_b, len(im[:,e_b])):
+            val_prev = im[y, e_b]
+            
+            for x in range(e_b + 1, len(im[0,:]) - e_b):
+                val = im[y, x]
+                
+                if val != val_prev:
+                    perim += 1
+                val_prev = val
+       
+            # Add 1 to perimeter for every illuminated diode on edge
+            if im[y, e_b] < 255:
+                perim += 1
+                num_on_edge += 1
+            if im[y, len(im[0,:]) - e_b - 1] < 255:
+                perim += 1
+                num_on_edge += 1
+        
+        w_l_r_p = min(round(np.percentile(lengths_r, 75) - np.percentile(lengths_r, 25), 1),  
+                     round(np.percentile(widths_r, 75) - np.percentile(widths_r, 25), 1))
+            
+        d_max = max(x_dim_shifted, y_dim_shifted)
+        
+        cir_area_ratio = area/(math.pi*((d_max/2)**2))
+        
+        edge_diam_ratio  = num_on_edge / (2 * d_max)
+        
+        try:
+            O = round(mean([count_fully_occulted_r/count_any_occulted_r, count_fully_occulted_c/count_any_occulted_c]), 3)
+        except ZeroDivisionError:
+            O = 0
+        
+        return perim, w_l_r_p, area, O, r_2, x_dim_shifted, y_dim_shifted, max_gap, d_max, cir_area_ratio, edge_diam_ratio
+        
+        # Calculate the crystal habit based on its morphological properties
+ 
+    '''
+    def get_habit(a, r_2, d, O, F, x, y, w_l_p, m_g, c_r):
+        if a < 50:
+            return 0 # Tiny
+        if (m_g > 1 + d/10):
+            return 7 # Irregular
+        #print(w_l_p)
+        
+        if (x > (220 - e_b * 2) * 0.8) and (y > (165 - e_b * 2) * 0.8):
+            needed_ratio = 5
+        else:
+            needed_ratio = min((1.2 + (w_l_p/20) + (6/d)*(w_l_p)), 5)
+        
+        if (x >= needed_ratio * y) or (y >= needed_ratio * x):
+            return 1 # Column
+        if d >= 100:
+            if F <= (30 - (abs(1 - c_r)*20)):
+                return 3 # Graupel
+            elif F > 100:
+                return 6 # Dendrite
+            elif d >= 140:
+                return 2 # Aggregate
+        if F <= (15 - (abs(1 - c_r)*10)):
+            return 4 # Sphere
+        else:
+            if O < 0.30 or F > 100:
+                # Hexagonal planar crystals tend to have low opacity
+                return 5 # Simple planar
+            else:
+                return 7 # Irregular
+        '''
+            
+   
+    def get_habit(a, r_2, d, O, F, x, y, w_l_p, m_g, c_r, e_d_r):
+        if a < 50:
+            return 0 # Tiny
+        #print(w_l_p)
+        
+        if m_g > 1 + d/4:
+            return 7 # Irregular
+        
+        needed_ratio = min((1.2 + (w_l_p/20) + (6/d)*(w_l_p) + e_d_r), 5)
+        
+        needed_ratio +=  m_g/5
+        
+        aspect_ratio = max(x/y, y/x)
+        
+        if (aspect_ratio >= needed_ratio):
+            return 1 # Column
+        if d >= 100:
+            if F <= (40 - (abs(1 - c_r)*20)) / aspect_ratio:
+                return 3 # Graupel
+            elif F > 85 * aspect_ratio:
+                return 6 # Dendrite
+            elif d >= 140:
+                return 2 # Aggregate
+        if F <= ((20 - (abs(1 - c_r)*10))) / aspect_ratio:
+            return 4 # Sphere
+        else:
+            if O < 0.30 or F > 100:
+                # Hexagonal planar crystals tend to have low opacity
+                return 5 # Simple planar
+            else:
+                return 7 # Irregular
+            
+        '''
         if a < 100:
             return 0 #Tiny
         if (r_2 >= 0.6) or (d < 150 and (x >= 2*y or y >= 2*x)) or (x >= 4*y or y >= 4*x):
@@ -381,6 +749,7 @@ def analyze_images(import_path, export_path, date, campaign, write_netCDF, e_b, 
                 return 5 # Simple planar
             else:
                 return 7 # Irregular
+        '''
 
     # How habit categories are labeled in output file
     habit_classes =  \
@@ -470,26 +839,13 @@ def analyze_images(import_path, export_path, date, campaign, write_netCDF, e_b, 
         #im = im.resize((x_dim,y_dim))
         im = np.array(im)
         
-        # Calculate area in terms of number of diodes
-        a = len(im[im < 255])
-        
-        # Calulate dmax and dimensions in x and y axes
-        d, y, x = get_dmax(im)
-        
-        # Calculate perimeter
-        p = get_perim(im)
-        
-        # Calculate coefficient of determination
-        r_2 = get_r2(im)
-        
-        # Calculate obscurity of particle
-        O = get_O(im_string, 4)
+        p, w_l_p, a, O, r_2, x, y, m_g, d, c_r, e_d_r = get_all_params(im)
         
         # Calculate feature ratio
         F = round(p*d/a, 3)
         
         # Get Holroyd habit
-        habit = int(get_habit(a, r_2, d, O, F, x, y))
+        habit = int(get_habit(a, r_2, d, O, F, x, y, w_l_p, m_g, c_r, e_d_r))
          
         # Populate data arrays
         habits[z] = habit
@@ -511,8 +867,10 @@ def analyze_images(import_path, export_path, date, campaign, write_netCDF, e_b, 
         print(f'a = {a}, r_2 = {r_2}, d = {d}, O = {O}, F = {F}, x = {x}, y = {y}, p = {p}')
         '''
         
+        '''
         if d * pixel_in_mm > 0.1 and habit > 0:
             shutil.copy(im_string, f'/Users/julian/Desktop/IMPACTS/PHIPS_classification_results/{habit_classes[habit]}/testing_{date}_{z}.png')
+        '''
 
         z += 1
 
